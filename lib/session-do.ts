@@ -8,15 +8,28 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
+import { streamText, stepCountIs } from "ai";
 import type {
   CampaignPlan,
   ChannelId,
   ResearchOutput,
   SessionState,
+  SessionStatus,
   Social,
+  SpotlightPayload,
 } from "./types";
 import type { SerializedPart } from "./serialized-parts";
-import type { CalendarEvent } from "./events";
+import { encodeSse, SSE_HEARTBEAT, type CalendarEvent } from "./events";
+import {
+  getGoogle,
+  MODEL_IDS,
+  ORCHESTRATOR_PROVIDER_OPTIONS,
+} from "./llm/google";
+import {
+  ORCHESTRATOR_SYSTEM_PROMPT,
+  buildOrchestratorUserMessage,
+} from "./orchestrator/prompts";
+import { createOrchestratorTools } from "./orchestrator/tools";
 
 type Env = {
   SESSION_DO: DurableObjectNamespace;
@@ -29,6 +42,8 @@ type Env = {
 };
 
 export class SessionDO extends DurableObject<Env> {
+  #subscribers = new Set<WritableStreamDefaultWriter<Uint8Array>>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -148,18 +163,166 @@ export class SessionDO extends DurableObject<Env> {
 
   // ─────────────── Lane B: calendar orchestrator ───────────────
 
-  async startCalendar(_selectedChannels: ChannelId[]): Promise<void> {
-    // Lane B fills this in.
+  async startCalendar(selectedChannels: ChannelId[]): Promise<void> {
+    const state = await this.getSessionState();
+    if (!state) {
+      console.warn("[calendar] startCalendar: no session state");
+      return;
+    }
+    if (!state.research) {
+      await this.updateSessionState({
+        status: "error",
+        error: "Cannot start calendar: research not complete",
+      });
+      return;
+    }
+    await this.updateSessionState({
+      status: "generating",
+      plan: { ...(state.plan ?? {}), selectedChannels },
+    });
+    const sidTag = `[calendar:${state.sid.slice(0, 6)}]`;
+    console.log(`${sidTag} startCalendar channels=${selectedChannels.join(",")}`);
+    this.ctx.waitUntil(
+      this.#runOrchestrator(state.sid, state.research, selectedChannels).catch(
+        async (err) => {
+          console.error(`${sidTag} orchestrator failed`, err);
+          const message = err instanceof Error ? err.message : String(err);
+          await this.updateSessionState({ status: "error", error: message });
+          await this.emitSse({
+            type: "error",
+            message,
+            ts: Date.now(),
+          });
+        },
+      ),
+    );
   }
 
-  async subscribeCalendar(_request: Request): Promise<Response> {
-    return new Response("not implemented", { status: 501 });
+  async #runOrchestrator(
+    sid: string,
+    research: ResearchOutput,
+    selectedChannels: ChannelId[],
+  ): Promise<void> {
+    const [start, end] = dateWindow(30);
+    const google = getGoogle(this.env);
+
+    const tools = createOrchestratorTools(this.env, {
+      sid,
+      do: {
+        emitSse: (event) => this.emitSse(event),
+        setSpotlight: (s) => this.setSpotlight(s),
+        setStatus: (status) => this.setStatus(status),
+      },
+      dateWindow: [start, end],
+    });
+
+    const result = streamText({
+      model: google(MODEL_IDS.ORCHESTRATOR),
+      system: ORCHESTRATOR_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: buildOrchestratorUserMessage({
+            research,
+            selectedChannels,
+            dateWindow: [start, end],
+          }),
+        },
+      ],
+      tools,
+      stopWhen: stepCountIs(30),
+      providerOptions: ORCHESTRATOR_PROVIDER_OPTIONS,
+    });
+
+    await result.consumeStream();
+  }
+
+  async emitSse(event: CalendarEvent): Promise<void> {
+    await this.appendCalendarEvent(event);
+    const chunk = new TextEncoder().encode(encodeSse(event));
+    const writers = Array.from(this.#subscribers);
+    const results = await Promise.allSettled(
+      writers.map((w) => w.write(chunk)),
+    );
+    results.forEach((r, i) => {
+      if (r.status === "rejected") this.#subscribers.delete(writers[i]);
+    });
+  }
+
+  async setSpotlight(ref: {
+    date: string;
+    channel: ChannelId;
+    payload: SpotlightPayload;
+  }): Promise<void> {
+    const state = await this.getSessionState();
+    if (!state) return;
+    const plan: CampaignPlan = {
+      selectedChannels: state.plan?.selectedChannels ?? [],
+      spotlightRef: { date: ref.date, channel: ref.channel, payload: ref.payload },
+    };
+    await this.updateSessionState({ plan });
+  }
+
+  async setStatus(status: SessionStatus): Promise<void> {
+    await this.updateSessionState({ status });
+  }
+
+  async subscribeCalendar(request: Request): Promise<Response> {
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    // Replay journal first so reconnecting clients see prior events before live ones.
+    const journal = await this.readCalendarJournal();
+    if (journal.length > 0) {
+      await writer.write(
+        encoder.encode(journal.map(encodeSse).join("")),
+      );
+    }
+
+    this.#subscribers.add(writer);
+
+    const heartbeat = setInterval(() => {
+      writer.write(encoder.encode(SSE_HEARTBEAT)).catch(() => {
+        clearInterval(heartbeat);
+      });
+    }, 15000);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      this.#subscribers.delete(writer);
+      writer.close().catch(() => {});
+    };
+    request.signal.addEventListener("abort", cleanup);
+
+    // If calendar already completed before this subscriber arrived, close after replay.
+    const state = await this.getSessionState();
+    if (state?.status === "done" || state?.status === "error") {
+      // Keep writer open briefly so the client can read replay; then close.
+      setTimeout(cleanup, 100);
+    }
+
+    return new Response(readable, {
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+      },
+    });
   }
 
   async getPlan(): Promise<CampaignPlan | null> {
     const state = await this.getSessionState();
     return state?.plan ?? null;
   }
+}
+
+function dateWindow(days: number): [string, string] {
+  const now = Date.now();
+  const DAY = 86400000;
+  const start = new Date(now + DAY).toISOString().slice(0, 10);
+  const end = new Date(now + days * DAY).toISOString().slice(0, 10);
+  return [start, end];
 }
 
 export default SessionDO;

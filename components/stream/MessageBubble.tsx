@@ -10,6 +10,8 @@ import {
   normalizeToolPart,
   type ToolPart,
 } from "./ToolCallLine";
+import { AskInline, type AskInput } from "@/components/research/AskInline";
+import { useAskAnswer } from "@/components/research/AskAnswerContext";
 
 export type RenderedSegment =
   | { kind: "text"; text: string }
@@ -81,6 +83,7 @@ export function MessageBubble({
   }
 
   const segments = groupPartsForRendering(message.parts);
+  const askAnswer = useAskAnswer();
 
   return (
     <div className={cn("flex flex-col gap-2 max-w-[85%] mr-auto", className)}>
@@ -100,8 +103,36 @@ export function MessageBubble({
                 isStreaming={isStreaming && i === segments.length - 1}
               />
             );
-          case "tool":
-            return <ToolCallLine key={`tl-${i}`} tool={seg.tool} />;
+          case "tool": {
+            const t = seg.tool;
+            if (
+              t.toolName === "askUser" &&
+              t.state === "input-available" &&
+              askAnswer
+            ) {
+              return (
+                <AskInline
+                  key={`ask-${t.toolCallId}`}
+                  toolCallId={t.toolCallId}
+                  input={t.input as AskInput}
+                  onSubmit={(reply) => askAnswer(t.toolCallId, reply)}
+                />
+              );
+            }
+            if (t.toolName === "askUser" && t.state === "output-available") {
+              const reply = (t.output as { reply?: string | string[] } | undefined)?.reply;
+              const text = Array.isArray(reply) ? reply.join(", ") : reply ?? "";
+              return (
+                <p
+                  key={`ask-ans-${t.toolCallId}`}
+                  className="text-sm text-muted-foreground italic"
+                >
+                  You answered: {text}
+                </p>
+              );
+            }
+            return <ToolCallLine key={`tl-${i}`} tool={t} />;
+          }
           default:
             return null;
         }

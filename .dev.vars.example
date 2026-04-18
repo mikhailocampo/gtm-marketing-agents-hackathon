@@ -1,0 +1,6 @@
+GOOGLE_GENERATIVE_AI_API_KEY=
+APIFY_TOKEN=
+DEMO_FALLBACK=1
+# Public R2 URL for the gtm-agent-images bucket.
+# Create with: wrangler r2 bucket create gtm-agent-images && wrangler r2 bucket dev-url enable gtm-agent-images
+R2_PUBLIC_URL=https://pub-xxxxx.r2.dev

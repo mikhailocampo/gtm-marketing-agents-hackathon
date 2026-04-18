@@ -1,24 +1,41 @@
 {
-  "name": "gtm-bootstrap",
+  "name": "gtm-agent",
   "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:worker": "opennextjs-cloudflare build && wrangler dev --persist-to .wrangler/state",
     "build": "next build",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts",
     "start": "next start"
   },
   "dependencies": {
+    "@ai-sdk/google": "^3.0.64",
+    "@ai-sdk/react": "^3.0.170",
+    "ai": "^6.0.168",
+    "apify-client": "^2.23.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.8.0",
+    "nanoid": "^5.1.9",
     "next": "16.2.4",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "tailwind-merge": "^3.5.0",
+    "zod": "^4.3.6",
+    "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260418.1",
+    "@opennextjs/cloudflare": "^1.19.1",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^4.83.0"
   },
   "ignoreScripts": [
     "sharp",

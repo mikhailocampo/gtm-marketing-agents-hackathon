@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gtm-agent",
+  "main": "worker-entry.ts",
+  "compatibility_date": "2025-03-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
+  "durable_objects": {
+    "bindings": [{ "name": "SESSION_DO", "class_name": "SessionDO" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SessionDO"] }
+  ],
+  "r2_buckets": [
+    { "binding": "IMAGES", "bucket_name": "gtm-agent-images" }
+  ],
+  "vars": { "DEMO_FALLBACK": "1" }
+  // secrets (wrangler secret put): GOOGLE_GENERATIVE_AI_API_KEY, APIFY_TOKEN, R2_PUBLIC_URL
+}

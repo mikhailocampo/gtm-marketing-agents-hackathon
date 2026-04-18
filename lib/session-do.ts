@@ -8,7 +8,8 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { streamText, stepCountIs } from "ai";
+import { convertToModelMessages, stepCountIs, streamText } from "ai";
+import type { UIMessage } from "ai";
 import type {
   CampaignPlan,
   ChannelId,
@@ -19,25 +20,33 @@ import type {
   SpotlightPayload,
 } from "./types";
 import type { SerializedPart } from "./serialized-parts";
+import { serializeStepContent, buildUIMessages } from "./serialized-parts";
 import { encodeSse, SSE_HEARTBEAT, type CalendarEvent } from "./events";
 import {
   getGoogle,
   MODEL_IDS,
   ORCHESTRATOR_PROVIDER_OPTIONS,
+  RESEARCH_PROVIDER_OPTIONS,
 } from "./llm/google";
 import {
   ORCHESTRATOR_SYSTEM_PROMPT,
   buildOrchestratorUserMessage,
 } from "./orchestrator/prompts";
 import { createOrchestratorTools } from "./orchestrator/tools";
+import { createResearchTools } from "./research/tools";
+import {
+  RESEARCH_SYSTEM_PROMPT,
+  buildSeedUserMessage,
+} from "./research/prompts";
 
-type Env = {
+export type Env = {
   SESSION_DO: DurableObjectNamespace;
   IMAGES: R2Bucket;
   ASSETS: Fetcher;
   GOOGLE_GENERATIVE_AI_API_KEY?: string;
+  GEMINI_API_KEY?: string;
   APIFY_TOKEN?: string;
-  DEMO_FALLBACK?: string;
+  APIFY_API_KEY?: string;
   R2_PUBLIC_URL?: string;
 };
 
@@ -148,17 +157,92 @@ export class SessionDO extends DurableObject<Env> {
 
   // ─────────────── Lane A: research chat ───────────────
 
-  async handleChat(_request: Request): Promise<Response> {
-    return new Response("not implemented", { status: 501 });
+  async handleChat(request: Request): Promise<Response> {
+    const state = await this.getSessionState();
+    if (!state) {
+      return new Response(JSON.stringify({ error: "session_not_found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    const body = (await request.json()) as { messages: UIMessage[] };
+    const incoming = body.messages ?? [];
+
+    // Auto-seed: if this is the first POST and the user hasn't typed anything,
+    // synthesize the seed message from the stored websiteUrl + socials.
+    let messages = incoming;
+    if (incoming.length === 0) {
+      const seedText = buildSeedUserMessage({
+        websiteUrl: state.websiteUrl,
+        socials: state.socials,
+      });
+      messages = [
+        {
+          id: "seed",
+          role: "user",
+          parts: [{ type: "text", text: seedText }],
+        } as UIMessage,
+      ];
+    }
+
+    const google = getGoogle(this.env);
+    const brandContext = `${state.websiteUrl}`;
+    const sid = state.sid;
+
+    const tools = createResearchTools({
+      env: this.env,
+      sid,
+      brandContext,
+      onFinalize: async (output) => {
+        await this.updateSessionState({
+          research: output,
+          status: "ready_to_confirm",
+        });
+        console.log(
+          `[research:${sid.slice(0, 6)}] finalized; status=ready_to_confirm`,
+        );
+      },
+    });
+
+    const result = streamText({
+      model: google(MODEL_IDS.RESEARCH),
+      system: RESEARCH_SYSTEM_PROMPT,
+      messages: await convertToModelMessages(messages),
+      tools,
+      stopWhen: stepCountIs(25),
+      providerOptions: RESEARCH_PROVIDER_OPTIONS,
+      onFinish: async ({ steps }) => {
+        const parts = serializeStepContent(steps as never);
+        if (parts.length > 0) {
+          await this.appendResearchParts(parts);
+        }
+      },
+    });
+
+    return result.toUIMessageStreamResponse({
+      headers: { "X-Session-Id": sid },
+    });
   }
 
   async getResearchReplay(): Promise<{
     researchOutput?: ResearchOutput;
     journal: SerializedPart[];
+    uiMessages: UIMessage[];
   }> {
     const state = await this.getSessionState();
     const journal = await this.readResearchJournal();
-    return { researchOutput: state?.research, journal };
+    // Wrap the entire journal as one synthetic assistant message so that
+    // buildUIMessages can rehydrate the reasoning + tool-call + result parts.
+    const uiMessages = buildUIMessages([
+      {
+        id: "journal",
+        role: "assistant",
+        content: "",
+        metadata: { structured_parts: journal },
+      },
+    ]);
+    return { researchOutput: state?.research, journal, uiMessages };
   }
 
   // ─────────────── Lane B: calendar orchestrator ───────────────
